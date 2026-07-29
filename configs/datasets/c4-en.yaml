@@ -1,0 +1,11 @@
+source: allenai/c4
+subset: en
+split: validation
+revision: null
+text_field: text
+mode: document
+separator: "\n\n"
+prediction_length: 512
+max_windows: 32
+streaming: true
+
