@@ -6,7 +6,12 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
-from cacheprior.cache import combine_replay_metrics, replay_belady, replay_lru
+from cacheprior.cache import (
+    combine_replay_metrics,
+    replay_belady,
+    replay_lru,
+    replay_static_prefix,
+)
 from cacheprior.config import (
     load_dataset_config,
     load_experiment_config,
@@ -14,6 +19,7 @@ from cacheprior.config import (
 from cacheprior.evaluation import run_experiment
 from cacheprior.models.olmoe import load_hf_model_and_tokenizer
 from cacheprior.report import write_summary
+from cacheprior.sweep import linear_lambda_grid, log_dense_lambda_grid
 from cacheprior.trace import read_trace
 
 
@@ -34,6 +40,7 @@ def _command_run(args: argparse.Namespace) -> int:
         config = config.with_routing(
             policy=args.routing,
             lambda_value=lambda_value,
+            top_j=args.top_j,
         )
     elif args.lambda_value is not None:
         config = config.with_routing(
@@ -68,8 +75,12 @@ def _command_replay(args: argparse.Namespace) -> int:
         ids = trace.original_ids if args.route == "original" else trace.selected_ids
         if args.policy == "lru":
             metrics.append(replay_lru(ids, trace.selected_weights, args.capacity))
-        else:
+        elif args.policy == "belady":
             metrics.append(replay_belady(ids, trace.selected_weights, args.capacity))
+        else:
+            metrics.append(
+                replay_static_prefix(ids, trace.selected_weights, args.capacity)
+            )
     result = combine_replay_metrics(metrics).to_dict()
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
@@ -83,12 +94,25 @@ def _command_summarize(args: argparse.Namespace) -> int:
 
 def _command_matrix(args: argparse.Namespace) -> int:
     base = load_experiment_config(args.base_config)
+    if args.top_j is not None:
+        base = replace(base, routing=replace(base.routing, top_j=args.top_j))
     if args.output_root:
         base = replace(
             base,
             trace=replace(base.trace, output_dir=args.output_root),
         )
     model, tokenizer = load_hf_model_and_tokenizer(base.model)
+    if args.lambdas is not None:
+        lambda_values = tuple(args.lambdas)
+    elif args.lambda_grid == "log":
+        lambda_values = log_dense_lambda_grid(
+            args.lambda_points,
+            min_positive=args.lambda_min,
+        )
+    elif args.lambda_grid == "linear":
+        lambda_values = linear_lambda_grid(args.lambda_points)
+    else:
+        lambda_values = (0.5,)
     run_dirs: list[Path] = []
     for dataset_path in args.datasets:
         dataset = load_dataset_config(dataset_path)
@@ -97,7 +121,7 @@ def _command_matrix(args: argparse.Namespace) -> int:
             lambda_value=0.0,
         )
         run_dirs.append(run_experiment(original, model=model, tokenizer=tokenizer))
-        for lambda_value in args.lambdas:
+        for lambda_value in lambda_values:
             cache_prior = base.with_dataset(dataset).with_routing(
                 policy="cache_prior",
                 lambda_value=lambda_value,
@@ -125,13 +149,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dataset")
     run.add_argument("--routing", choices=("original", "cache_prior"))
     run.add_argument("--lambda", dest="lambda_value", type=float)
+    run.add_argument("--top-j", type=int)
     run.add_argument("--output-root")
     run.set_defaults(func=_command_run)
 
     replay = subparsers.add_parser("replay")
     replay.add_argument("--trace", required=True)
     replay.add_argument("--capacity", required=True, type=int)
-    replay.add_argument("--policy", choices=("lru", "belady"), required=True)
+    replay.add_argument(
+        "--policy", choices=("lru", "belady", "static-prefix"), required=True
+    )
     replay.add_argument("--route", choices=("original", "selected"), default="original")
     replay.set_defaults(func=_command_replay)
 
@@ -143,7 +170,12 @@ def build_parser() -> argparse.ArgumentParser:
     matrix = subparsers.add_parser("matrix")
     matrix.add_argument("--base-config", required=True)
     matrix.add_argument("--datasets", nargs="+", required=True)
-    matrix.add_argument("--lambdas", nargs="+", type=float, default=[0.5])
+    lambda_selection = matrix.add_mutually_exclusive_group()
+    lambda_selection.add_argument("--lambdas", nargs="+", type=float)
+    lambda_selection.add_argument("--lambda-grid", choices=("log", "linear"))
+    matrix.add_argument("--lambda-points", type=int, default=50)
+    matrix.add_argument("--lambda-min", type=float, default=1e-3)
+    matrix.add_argument("--top-j", type=int)
     matrix.add_argument("--output-root")
     matrix.add_argument("--summary-dir", required=True)
     matrix.set_defaults(func=_command_matrix)

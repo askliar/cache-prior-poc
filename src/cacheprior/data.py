@@ -37,6 +37,7 @@ class DatasetManifest:
     revision: str | None
     fingerprint: str | None
     mode: str
+    join_before_tokenization: bool
     prediction_length: int
     max_windows: int | None
     streaming: bool
@@ -101,6 +102,7 @@ class HFTextDataset:
             revision=self.config.revision,
             fingerprint=getattr(dataset, "_fingerprint", None),
             mode=self.config.mode,
+            join_before_tokenization=self.config.join_before_tokenization,
             prediction_length=self.config.prediction_length,
             max_windows=self.config.max_windows,
             streaming=self.config.streaming,
@@ -114,7 +116,7 @@ class HFTextDataset:
         )
         return [int(value) for value in encoded["input_ids"]]
 
-    def _records(self) -> Iterable[str]:
+    def _records(self, *, include_empty: bool = False) -> Iterable[str]:
         dataset = self._load()
         for row in dataset:
             if self.config.text_field not in row:
@@ -122,7 +124,7 @@ class HFTextDataset:
                     f"dataset row does not contain text field {self.config.text_field!r}"
                 )
             text = row[self.config.text_field]
-            if text is not None and str(text).strip():
+            if text is not None and (include_empty or str(text).strip()):
                 yield str(text)
 
     def _make_window(
@@ -140,6 +142,17 @@ class HFTextDataset:
 
     def _iter_concatenated(self) -> Iterator[TokenWindow]:
         length = self.config.prediction_length
+        if self.config.join_before_tokenization:
+            text = self.config.separator.join(self._records(include_empty=True))
+            token_ids = self._encode(text)
+            for emitted, (input_ids, target_ids) in enumerate(
+                window_token_ids(token_ids, length)
+            ):
+                yield self._make_window(emitted, input_ids, target_ids)
+                if self.config.max_windows is not None and emitted + 1 >= self.config.max_windows:
+                    return
+            return
+
         separator_ids = self._encode(self.config.separator)
         buffer: list[int] = []
         emitted = 0

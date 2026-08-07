@@ -30,6 +30,7 @@ class DatasetConfig:
     text_field: str = "text"
     mode: str = "concatenate"
     separator: str = "\n\n"
+    join_before_tokenization: bool = False
     prediction_length: int = 512
     max_windows: int | None = 32
     streaming: bool = False
@@ -49,7 +50,7 @@ class CacheConfig:
     capacity: int = 32
     initial_state: str = "empty"
     reset: str = "per_window"
-    update_order: str = "ascending_original_probability"
+    update_order: str = "descending_original_probability"
     storage_bits: int = 16
 
 
@@ -72,8 +73,8 @@ class ExperimentConfig:
     def validate_static(self) -> None:
         if self.routing.policy not in {"original", "cache_prior"}:
             raise ValueError("routing.policy must be 'original' or 'cache_prior'")
-        if not 0.0 <= self.routing.lambda_value <= 1.0:
-            raise ValueError("routing.lambda must be in [0, 1]")
+        if self.routing.lambda_value < 0.0:
+            raise ValueError("routing.lambda must be non-negative")
         if self.routing.top_j < 0:
             raise ValueError("routing.top_j must be non-negative")
         if self.routing.range_estimator != "inclusive_running_mean":
@@ -86,18 +87,30 @@ class ExperimentConfig:
             raise ValueError("only an empty initial cache is supported")
         if self.cache.reset != "per_window":
             raise ValueError("only per_window cache reset is supported")
-        if self.cache.update_order != "ascending_original_probability":
-            raise ValueError("only ascending_original_probability update order is supported")
+        if self.cache.update_order != "descending_original_probability":
+            raise ValueError("only descending_original_probability update order is supported")
         if self.cache.storage_bits not in {4, 8, 16, 32}:
             raise ValueError("cache.storage_bits must be one of 4, 8, 16, or 32")
         if self.dataset.mode not in {"concatenate", "document"}:
             raise ValueError("dataset.mode must be 'concatenate' or 'document'")
+        if self.dataset.join_before_tokenization and self.dataset.mode != "concatenate":
+            raise ValueError("join_before_tokenization requires dataset.mode=concatenate")
+        if self.dataset.join_before_tokenization and self.dataset.streaming:
+            raise ValueError("join_before_tokenization is not supported for streaming datasets")
         if self.dataset.prediction_length <= 0:
             raise ValueError("dataset.prediction_length must be positive")
         if self.dataset.max_windows is not None and self.dataset.max_windows <= 0:
             raise ValueError("dataset.max_windows must be positive or null")
-        if self.model.quantization not in {"none", "8bit", "4bit"}:
-            raise ValueError("model.quantization must be none, 8bit, or 4bit")
+        if self.model.quantization not in {
+            "none",
+            "8bit",
+            "4bit",
+            "native",
+            "modelopt_fp8",
+        }:
+            raise ValueError(
+                "model.quantization must be none, 8bit, 4bit, native, or modelopt_fp8"
+            )
 
     def validate_for_model(self, *, top_k: int, num_experts: int) -> None:
         self.validate_static()
@@ -122,11 +135,18 @@ class ExperimentConfig:
     def with_dataset(self, dataset: DatasetConfig) -> ExperimentConfig:
         return replace(self, dataset=dataset)
 
-    def with_routing(self, *, policy: str, lambda_value: float | None = None) -> ExperimentConfig:
+    def with_routing(
+        self,
+        *,
+        policy: str,
+        lambda_value: float | None = None,
+        top_j: int | None = None,
+    ) -> ExperimentConfig:
         routing = replace(
             self.routing,
             policy=policy,
             lambda_value=self.routing.lambda_value if lambda_value is None else lambda_value,
+            top_j=self.routing.top_j if top_j is None else top_j,
         )
         return replace(self, routing=routing)
 

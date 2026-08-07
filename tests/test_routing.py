@@ -89,7 +89,7 @@ def test_cache_prior_promotes_cached_expert_and_uses_original_probability() -> N
     assert trace.route_divergence == 0.25
 
 
-def test_top_j_is_always_retained() -> None:
+def test_top_j_is_retained_without_non_finite_rerank_logits(monkeypatch) -> None:
     raw = torch.randn(20, 4)
     probs, scores, ids = _original_outputs(raw)
     controller = RoutingController(
@@ -98,6 +98,13 @@ def test_top_j_is_always_retained() -> None:
         CACHE,
     )
     controller.begin_sequence("sample", expected_tokens=20)
+    original_topk = torch.topk
+
+    def finite_topk(values, *args, **kwargs):
+        assert torch.isfinite(values).all()
+        return original_topk(values, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "topk", finite_topk)
     _, selected_ids = controller.route(
         layer_id=0,
         raw_logits=raw,

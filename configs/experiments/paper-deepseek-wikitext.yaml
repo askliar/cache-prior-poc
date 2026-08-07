@@ -1,14 +1,14 @@
 model:
-  id: allenai/OLMoE-1B-7B-0924
+  id: deepseek-ai/DeepSeek-V2-Lite
   revision: null
   tokenizer_id: null
   tokenizer_revision: null
-  adapter: olmoe
+  adapter: deepseek_v2
   dtype: bfloat16
   device: cuda:0
-  attention_implementation: sdpa
+  attention_implementation: eager
   quantization: none
-  trust_remote_code: false
+  trust_remote_code: true
 
 dataset:
   source: Salesforce/wikitext
@@ -18,8 +18,9 @@ dataset:
   text_field: text
   mode: concatenate
   separator: "\n\n"
-  prediction_length: 512
-  max_windows: 32
+  join_before_tokenization: true
+  prediction_length: 1024
+  max_windows: null
   streaming: false
 
 routing:
@@ -41,4 +42,4 @@ trace:
   output_dir: runs
 
 seed: 1234
-run_name: proof
+run_name: paper-deepseek-wikitext

@@ -1,0 +1,11 @@
+source: Salesforce/wikitext
+subset: wikitext-2-raw-v1
+split: validation
+revision: null
+text_field: text
+mode: concatenate
+separator: "\n\n"
+join_before_tokenization: true
+prediction_length: 1024
+max_windows: null
+streaming: false

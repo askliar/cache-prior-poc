@@ -1,14 +1,14 @@
 model:
-  id: allenai/OLMoE-1B-7B-0924
-  revision: null
+  id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
+  revision: f8dc1c0afee92f44417695b4f5ddca9afc95ea58
   tokenizer_id: null
-  tokenizer_revision: null
-  adapter: olmoe
+  tokenizer_revision: f8dc1c0afee92f44417695b4f5ddca9afc95ea58
+  adapter: nemotron_h
   dtype: bfloat16
   device: cuda:0
-  attention_implementation: sdpa
-  quantization: none
-  trust_remote_code: false
+  attention_implementation: eager
+  quantization: modelopt_fp8
+  trust_remote_code: true
 
 dataset:
   source: Salesforce/wikitext
@@ -18,13 +18,14 @@ dataset:
   text_field: text
   mode: concatenate
   separator: "\n\n"
-  prediction_length: 512
+  join_before_tokenization: true
+  prediction_length: 1024
   max_windows: 32
   streaming: false
 
 routing:
-  policy: cache_prior
-  lambda: 0.5
+  policy: original
+  lambda: 0.0
   top_j: 2
   range_estimator: inclusive_running_mean
 
@@ -34,11 +35,11 @@ cache:
   initial_state: empty
   reset: per_window
   update_order: descending_original_probability
-  storage_bits: 16
+  storage_bits: 8
 
 trace:
   level: compact
   output_dir: runs
 
 seed: 1234
-run_name: proof
+run_name: nemotron3-nano-fp8-cache32

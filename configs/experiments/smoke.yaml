@@ -33,7 +33,7 @@ cache:
   capacity: 32
   initial_state: empty
   reset: per_window
-  update_order: ascending_original_probability
+  update_order: descending_original_probability
   storage_bits: 16
 
 trace:
@@ -42,4 +42,3 @@ trace:
 
 seed: 1234
 run_name: smoke
-

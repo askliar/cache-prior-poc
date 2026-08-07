@@ -15,7 +15,7 @@ dependencies = [
   "numpy>=1.26",
   "PyYAML>=6",
   "torch>=2.2",
-  "transformers>=5.0,<6",
+  "transformers>=4.48.3,<6",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +26,13 @@ dev = [
 ]
 plot = ["matplotlib>=3.8"]
 quantization = ["accelerate>=1", "bitsandbytes>=0.45"]
+nemotron = [
+  "accelerate>=1",
+  "causal-conv1d>=1.5",
+  "mamba-ssm>=2.2.5",
+  "nvidia-modelopt[torch,hf]>=0.29",
+  "transformers>=4.57.3,<5",
+]
 
 [project.scripts]
 cacheprior = "cacheprior.cli:main"
@@ -40,7 +47,7 @@ addopts = "-ra"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = [".venv-*", "remote-test-results"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-

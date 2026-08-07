@@ -1,9 +1,9 @@
 model:
-  id: allenai/OLMoE-1B-7B-0924
+  id: Qwen/Qwen1.5-MoE-A2.7B
   revision: null
   tokenizer_id: null
   tokenizer_revision: null
-  adapter: olmoe
+  adapter: qwen2_moe
   dtype: bfloat16
   device: cuda:0
   attention_implementation: sdpa
@@ -18,8 +18,9 @@ dataset:
   text_field: text
   mode: concatenate
   separator: "\n\n"
-  prediction_length: 512
-  max_windows: 32
+  join_before_tokenization: true
+  prediction_length: 1024
+  max_windows: null
   streaming: false
 
 routing:
@@ -30,7 +31,7 @@ routing:
 
 cache:
   policy: lru
-  capacity: 32
+  capacity: 30
   initial_state: empty
   reset: per_window
   update_order: descending_original_probability
@@ -41,4 +42,4 @@ trace:
   output_dir: runs
 
 seed: 1234
-run_name: proof
+run_name: paper-qwen-wikitext

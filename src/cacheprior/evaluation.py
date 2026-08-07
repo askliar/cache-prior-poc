@@ -18,11 +18,11 @@ import torch.nn.functional as F
 from cacheprior.cache import ReplayMetrics, combine_replay_metrics, replay_belady
 from cacheprior.config import ExperimentConfig, dump_resolved_config
 from cacheprior.data import HFTextDataset
-from cacheprior.models.olmoe import (
-    OlmoeAdapter,
+from cacheprior.models import (
+    create_model_adapter,
     load_hf_model_and_tokenizer,
-    model_input_device,
 )
+from cacheprior.models.olmoe import model_input_device
 from cacheprior.routing import RoutingController
 from cacheprior.trace import RouteTrace, write_trace
 
@@ -188,11 +188,15 @@ def run_experiment(
         model, tokenizer = load_hf_model_and_tokenizer(config.model)
     model.eval()
 
-    if config.model.adapter != "olmoe":
-        raise ValueError("the initial implementation supports only adapter=olmoe")
-    adapter = OlmoeAdapter(model)
-    config.validate_for_model(top_k=adapter.top_k, num_experts=adapter.num_experts)
-    controller = RoutingController(adapter.layer_specs, config.routing, config.cache)
+    adapter = create_model_adapter(model, config.model.adapter)
+    is_dense = not bool(getattr(adapter, "is_moe", True))
+    if is_dense:
+        if config.routing.policy != "original":
+            raise ValueError("dense models support only routing.policy=original")
+        controller = None
+    else:
+        config.validate_for_model(top_k=adapter.top_k, num_experts=adapter.num_experts)
+        controller = RoutingController(adapter.layer_specs, config.routing, config.cache)
     dataset = HFTextDataset(config.dataset, tokenizer)
     run_dir = _run_directory(config)
 
@@ -219,17 +223,20 @@ def run_experiment(
 
     total_nll = 0.0
     total_tokens = 0
+    windows = 0
     traces: list[RouteTrace] = []
     input_device = model_input_device(model)
     samples_path = run_dir / "per_window.jsonl"
 
-    adapter.install(controller)
+    if controller is not None:
+        adapter.install(controller)
     try:
         with samples_path.open("w", encoding="utf-8") as sample_log:
             for window_index, window in enumerate(dataset):
                 input_ids = window.input_ids.to(input_device)
                 targets = window.target_ids.to(input_device)
-                controller.begin_sequence(window.sample_id, window.scored_tokens)
+                if controller is not None:
+                    controller.begin_sequence(window.sample_id, window.scored_tokens)
                 try:
                     with torch.inference_mode():
                         output = model(input_ids=input_ids, use_cache=False)
@@ -244,17 +251,21 @@ def run_experiment(
                         targets.reshape(-1),
                         reduction="sum",
                     )
-                    trace = controller.end_sequence()
+                    trace = controller.end_sequence() if controller is not None else None
                 except Exception:
-                    controller.abort_sequence()
+                    if controller is not None:
+                        controller.abort_sequence()
                     raise
 
-                trace_path = run_dir / "traces" / f"{window_index:06d}.npz"
-                write_trace(trace, trace_path)
-                traces.append(trace)
+                trace_path = None
+                if trace is not None:
+                    trace_path = run_dir / "traces" / f"{window_index:06d}.npz"
+                    write_trace(trace, trace_path)
+                    traces.append(trace)
                 nll_value = float(nll.item())
                 total_nll += nll_value
                 total_tokens += window.scored_tokens
+                windows += 1
                 record = {
                     "sample_id": window.sample_id,
                     "dataset_id": window.dataset_id,
@@ -262,50 +273,68 @@ def run_experiment(
                     "scored_tokens": window.scored_tokens,
                     "negative_log_likelihood": nll_value,
                     "perplexity": math.exp(nll_value / window.scored_tokens),
-                    "cache_hits": trace.hits,
-                    "cache_misses": trace.misses,
-                    "route_divergence": trace.route_divergence,
-                    "trace": str(trace_path.relative_to(run_dir)),
+                    "cache_hits": trace.hits if trace is not None else None,
+                    "cache_misses": trace.misses if trace is not None else None,
+                    "route_divergence": trace.route_divergence if trace is not None else None,
+                    "trace": str(trace_path.relative_to(run_dir)) if trace_path else None,
                 }
                 sample_log.write(json.dumps(record, sort_keys=True) + "\n")
     finally:
-        adapter.restore()
+        if controller is not None:
+            adapter.restore()
         if owns_model and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    if not traces:
+    if not windows:
         raise RuntimeError("dataset produced no complete token windows")
 
-    expert_counts = adapter.expert_parameter_counts()
-    live = _live_metrics(traces)
-    cache_results: dict[str, Any] = {
-        "none": {
+    if is_dense:
+        cache_results: dict[str, Any] = {
+            "none": {
+                "applicable": False,
+                "note": "Dense-model perplexity run; expert cache policies do not apply.",
+            }
+        }
+        routing_metrics: dict[str, Any] = {
             "applicable": False,
-            "note": "Quality-only baseline; no expert cache is simulated.",
-        },
-        "lru": _cache_metrics_with_transfer(
-            live,
-            scored_tokens=total_tokens,
-            expert_parameter_counts=expert_counts,
-            storage_bits=config.cache.storage_bits,
-        ),
-    }
-
-    if config.routing.policy == "original":
-        belady = combine_replay_metrics(
-            replay_belady(
-                trace.original_ids,
-                trace.selected_weights,
-                config.cache.capacity,
+            "token_layer_events": 0,
+            "changed_token_layer_events": 0,
+            "changed_fraction": 0.0,
+            "mean_set_divergence": 0.0,
+            "top_j_retention": 1.0,
+        }
+    else:
+        expert_counts = adapter.expert_parameter_counts()
+        live = _live_metrics(traces)
+        cache_results = {
+            "none": {
+                "applicable": False,
+                "note": "Quality-only baseline; no expert cache is simulated.",
+            },
+            "lru": _cache_metrics_with_transfer(
+                live,
+                scored_tokens=total_tokens,
+                expert_parameter_counts=expert_counts,
+                storage_bits=config.cache.storage_bits,
             )
-            for trace in traces
-        )
-        cache_results["belady"] = _cache_metrics_with_transfer(
-            belady,
-            scored_tokens=total_tokens,
-            expert_parameter_counts=expert_counts,
-            storage_bits=config.cache.storage_bits,
-        )
+        }
+
+        if config.routing.policy == "original":
+            belady = combine_replay_metrics(
+                replay_belady(
+                    trace.original_ids,
+                    trace.selected_weights,
+                    config.cache.capacity,
+                )
+                for trace in traces
+            )
+            cache_results["belady"] = _cache_metrics_with_transfer(
+                belady,
+                scored_tokens=total_tokens,
+                expert_parameter_counts=expert_counts,
+                storage_bits=config.cache.storage_bits,
+            )
+        routing_metrics = _routing_metrics(traces, config.routing.top_j)
 
     metrics = {
         "schema_version": 1,
@@ -320,8 +349,8 @@ def run_experiment(
             "perplexity": math.exp(total_nll / total_tokens),
         },
         "cache": cache_results,
-        "routing_change": _routing_metrics(traces, config.routing.top_j),
-        "windows": len(traces),
+        "routing_change": routing_metrics,
+        "windows": windows,
     }
     _json_dump(metrics, run_dir / "metrics.json")
     return run_dir

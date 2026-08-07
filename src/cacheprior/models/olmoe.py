@@ -51,7 +51,15 @@ class InstrumentedOlmoeRouter(nn.Module):
         # lambda=0 outputs remain version-faithful.
         first_output, original_scores, original_ids = self.original(hidden_states)
         flattened = hidden_states.reshape(-1, self.hidden_dim)
-        raw_logits = F.linear(flattened, self.original.weight)
+        if (
+            isinstance(first_output, torch.Tensor)
+            and first_output.numel() == flattened.shape[0] * self.num_experts
+        ):
+            # Reuse the exact router logits that produced original_ids. Repeating
+            # the low-precision GEMM can perturb extremely close expert ties.
+            raw_logits = first_output.reshape(-1, self.num_experts)
+        else:
+            raw_logits = F.linear(flattened, self.original.weight)
         original_probs = torch.softmax(raw_logits, dtype=torch.float32, dim=-1)
         selected_scores, selected_ids = self.controller.route(
             layer_id=self.layer_id,
@@ -196,6 +204,7 @@ def _torch_dtype(name: str) -> torch.dtype:
 
 
 def load_hf_model_and_tokenizer(config: ModelConfig) -> tuple[nn.Module, Any]:
+    import transformers
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer_id = config.tokenizer_id or config.id
@@ -208,12 +217,17 @@ def load_hf_model_and_tokenizer(config: ModelConfig) -> tuple[nn.Module, Any]:
     model_kwargs: dict[str, Any] = {
         "revision": config.revision,
         "trust_remote_code": config.trust_remote_code,
-        "dtype": _torch_dtype(config.dtype),
     }
+    dtype_argument = (
+        "dtype"
+        if int(transformers.__version__.split(".", 1)[0]) >= 5
+        else "torch_dtype"
+    )
+    model_kwargs[dtype_argument] = _torch_dtype(config.dtype)
     if config.attention_implementation:
         model_kwargs["attn_implementation"] = config.attention_implementation
 
-    if config.quantization != "none":
+    if config.quantization in {"8bit", "4bit"}:
         from transformers import BitsAndBytesConfig
 
         if config.quantization == "8bit":
@@ -221,8 +235,40 @@ def load_hf_model_and_tokenizer(config: ModelConfig) -> tuple[nn.Module, Any]:
         elif config.quantization == "4bit":
             model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
         model_kwargs["device_map"] = "auto"
+    elif config.quantization in {"native", "modelopt_fp8"}:
+        # Preserve a checkpoint's own packed representation. This follows the
+        # model publisher's from_pretrained(..., device_map="auto") contract
+        # without applying BitsAndBytes or casting packed weights afterward.
+        model_kwargs["device_map"] = "auto"
 
-    model = AutoModelForCausalLM.from_pretrained(config.id, **model_kwargs)
+    if config.quantization == "modelopt_fp8":
+        from transformers.utils import logging as transformers_logging
+
+        from cacheprior.models.modelopt_fp8 import (
+            apply_modelopt_fp8_checkpoint,
+            validate_modelopt_loading_info,
+        )
+
+        original_verbosity = transformers_logging.get_verbosity()
+        transformers_logging.set_verbosity_error()
+        try:
+            model, loading_info = AutoModelForCausalLM.from_pretrained(
+                config.id,
+                output_loading_info=True,
+                **model_kwargs,
+            )
+        finally:
+            transformers_logging.set_verbosity(original_verbosity)
+        validate_modelopt_loading_info(loading_info)
+        wrapped_linears = apply_modelopt_fp8_checkpoint(
+            model,
+            model_id=config.id,
+            revision=config.revision,
+            output_dtype=_torch_dtype(config.dtype),
+        )
+        model._cacheprior_modelopt_fp8_linears = wrapped_linears
+    else:
+        model = AutoModelForCausalLM.from_pretrained(config.id, **model_kwargs)
     if config.quantization == "none":
         model.to(torch.device(config.device))
     model.eval()

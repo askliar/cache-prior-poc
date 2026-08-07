@@ -5,6 +5,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 
 
 @dataclass(frozen=True)
@@ -55,11 +56,12 @@ class LRUCache:
         hits = tuple(int(expert_id) in pre_state for expert_id in expert_ids)
         evictions: list[int] = []
 
-        # Lowest-priority selected expert is touched first so the highest-priority
-        # expert is most recent after the atomic token event.
+        # Match the paper implementation: insert selected experts from highest
+        # to lowest router weight. The highest-weight expert is therefore least
+        # recent among this token's accesses and will be evicted first.
         update_order = sorted(
             zip(expert_ids, priorities, strict=True),
-            key=lambda item: (float(item[1]), int(item[0])),
+            key=lambda item: (-float(item[1]), int(item[0])),
         )
         for expert_id, _ in update_order:
             expert_id = int(expert_id)
@@ -72,6 +74,73 @@ class LRUCache:
             self._order[expert_id] = None
 
         return CacheAccessResult(hits, tuple(evictions), self.state)
+
+
+def vectorized_lru_membership(
+    expert_ids: torch.Tensor,
+    priorities: torch.Tensor,
+    *,
+    capacity: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Construct all pre-token LRU states for a fixed route tensor."""
+
+    if expert_ids.ndim != 2:
+        raise ValueError("expert_ids must have shape [tokens, top_k]")
+    if priorities.shape != expert_ids.shape:
+        raise ValueError("priorities must have the same shape as expert_ids")
+    if capacity <= 0 or capacity > num_experts:
+        raise ValueError("capacity must be in [1, num_experts]")
+    tokens, top_k = expert_ids.shape
+    if tokens == 0:
+        membership = torch.zeros(
+            (0, num_experts),
+            dtype=torch.bool,
+            device=expert_ids.device,
+        )
+        return membership, torch.zeros_like(expert_ids, dtype=torch.bool)
+
+    # Highest-priority selected experts are touched first and the lowest last,
+    # matching the atomic update order in LRUCache.observe.
+    id_order = torch.argsort(expert_ids, dim=-1, stable=True)
+    ids_by_id = expert_ids.gather(-1, id_order)
+    priorities_by_id = priorities.gather(-1, id_order)
+    priority_order = torch.argsort(
+        priorities_by_id,
+        dim=-1,
+        descending=True,
+        stable=True,
+    )
+    ordered_ids = ids_by_id.gather(-1, priority_order).to(torch.long)
+    token_offsets = torch.arange(tokens, device=expert_ids.device).unsqueeze(-1) * top_k
+    intra_token_order = torch.arange(top_k, device=expert_ids.device).unsqueeze(0)
+    timestamps = token_offsets + intra_token_order
+
+    events = torch.full(
+        (tokens, num_experts),
+        -1,
+        dtype=torch.long,
+        device=expert_ids.device,
+    )
+    events.scatter_(1, ordered_ids, timestamps)
+    last_use_inclusive = torch.cummax(events, dim=0).values
+    last_use_before = torch.cat(
+        (
+            torch.full_like(last_use_inclusive[:1], -1),
+            last_use_inclusive[:-1],
+        ),
+        dim=0,
+    )
+
+    resident_values, resident_ids = torch.topk(
+        last_use_before,
+        k=capacity,
+        dim=-1,
+    )
+    membership = torch.zeros_like(last_use_before, dtype=torch.bool)
+    membership.scatter_(1, resident_ids, resident_values >= 0)
+    hits = membership.gather(1, expert_ids.to(torch.long))
+    return membership, hits
 
 
 @dataclass(frozen=True)
@@ -183,7 +252,7 @@ def replay_belady(
 
             update_order = sorted(
                 zip(ids, probs, strict=True),
-                key=lambda item: (item[1], item[0]),
+                key=lambda item: (-item[1], item[0]),
             )
             for expert_id, _ in update_order:
                 if expert_id in resident:
@@ -213,6 +282,36 @@ def replay_belady(
         total_accesses - total_hits,
         tuple(layer_accesses),
         tuple(layer_hits),
+    )
+
+
+def replay_static_prefix(
+    expert_ids: np.ndarray,
+    priorities: np.ndarray,
+    capacity: int,
+) -> ReplayMetrics:
+    """Replay a fixed cache containing expert IDs ``[0, capacity)`` per layer.
+
+    The cache has no warm-up, insertions, evictions, or dependence on the
+    access order. ``priorities`` is validated for trace compatibility but does
+    not affect the static-cache result.
+    """
+
+    layers, _, _ = _validate_trace_arrays(expert_ids, priorities)
+    if capacity <= 0:
+        raise ValueError("capacity must be positive")
+
+    hit_mask = (expert_ids >= 0) & (expert_ids < capacity)
+    layer_accesses = tuple(int(expert_ids[layer].size) for layer in range(layers))
+    layer_hits = tuple(int(hit_mask[layer].sum()) for layer in range(layers))
+    accesses = sum(layer_accesses)
+    hits = sum(layer_hits)
+    return ReplayMetrics(
+        accesses,
+        hits,
+        accesses - hits,
+        layer_accesses,
+        layer_hits,
     )
 
 

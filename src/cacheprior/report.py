@@ -25,29 +25,44 @@ def _dataset_label(metrics: dict[str, Any]) -> str:
     return "/".join(parts)
 
 
+def _model_label(metrics: dict[str, Any]) -> str:
+    return str(metrics["model"]["model_id"])
+
+
+def _experiment_key(metrics: dict[str, Any]) -> tuple[str, str]:
+    return _model_label(metrics), _dataset_label(metrics)
+
+
 def comparison_rows(runs: Iterable[str | Path]) -> list[dict[str, Any]]:
     loaded = [_load_metrics(run) for run in runs]
-    baselines: dict[str, float] = {}
+    baselines: dict[tuple[str, str], float] = {}
     for metrics in loaded:
         if metrics["routing"]["policy"] == "original":
-            baselines[_dataset_label(metrics)] = float(metrics["quality"]["perplexity"])
+            baselines[_experiment_key(metrics)] = float(metrics["quality"]["perplexity"])
 
     rows: list[dict[str, Any]] = []
     for metrics in loaded:
+        model = _model_label(metrics)
         dataset = _dataset_label(metrics)
         quality = metrics["quality"]
         policy = metrics["routing"]["policy"]
         lambda_value = metrics["routing"].get("lambda_value", 0.0)
-        baseline_ppl = baselines.get(dataset)
+        baseline_ppl = baselines.get((model, dataset))
         delta_ppl = (
             (float(quality["perplexity"]) / baseline_ppl - 1.0) * 100.0 if baseline_ppl else None
         )
 
-        cache_names = ("none", "lru", "belady") if policy == "original" else ("lru",)
+        expected_cache_names = (
+            ("none", "lru", "belady") if policy == "original" else ("lru",)
+        )
+        cache_names = tuple(
+            name for name in expected_cache_names if name in metrics["cache"]
+        )
         for cache_name in cache_names:
             cache = metrics["cache"].get(cache_name, {})
             rows.append(
                 {
+                    "model": model,
                     "dataset": dataset,
                     "routing": policy,
                     "cache": cache_name,
@@ -64,6 +79,16 @@ def comparison_rows(runs: Iterable[str | Path]) -> list[dict[str, Any]]:
                     "run_directory": metrics["run_directory"],
                 }
             )
+    cache_order = {"none": 0, "lru": 1, "belady": 2}
+    rows.sort(
+        key=lambda row: (
+            row["model"],
+            row["dataset"],
+            0 if row["routing"] == "original" else 1,
+            row["lambda"],
+            cache_order.get(row["cache"], 99),
+        )
+    )
     return rows
 
 
@@ -90,6 +115,7 @@ def write_summary(runs: Iterable[str | Path], output_dir: str | Path) -> Path:
         writer.writerows(rows)
 
     headers = [
+        "Model",
         "Dataset",
         "Routing",
         "Cache",
@@ -102,6 +128,7 @@ def write_summary(runs: Iterable[str | Path], output_dir: str | Path) -> Path:
         "Route divergence",
     ]
     keys = [
+        "model",
         "dataset",
         "routing",
         "cache",
@@ -140,11 +167,11 @@ def _maybe_plot(rows: list[dict[str, Any]], output_dir: Path) -> None:
         import matplotlib.pyplot as plt
     except ImportError:
         return
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         if row["miss_rate"] is not None:
-            grouped[row["dataset"]].append(row)
-    for dataset, dataset_rows in grouped.items():
+            grouped[(row["model"], row["dataset"])].append(row)
+    for (model, dataset), dataset_rows in grouped.items():
         figure, axis = plt.subplots(figsize=(6, 4))
         for row in dataset_rows:
             label = f"{row['routing']}+{row['cache']}"
@@ -157,11 +184,14 @@ def _maybe_plot(rows: list[dict[str, Any]], output_dir: Path) -> None:
             )
         axis.set_xlabel("Expert cache miss rate")
         axis.set_ylabel("Relative perplexity increase (%)")
-        axis.set_title(dataset)
+        axis.set_title(f"{model}\n{dataset}")
         axis.grid(True, alpha=0.25)
         axis.legend(fontsize=8)
         figure.tight_layout()
-        figure.savefig(output_dir / f"{_safe_name(dataset)}.png", dpi=160)
+        figure.savefig(
+            output_dir / f"{_safe_name(model)}--{_safe_name(dataset)}.png",
+            dpi=160,
+        )
         plt.close(figure)
 
 

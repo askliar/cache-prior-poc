@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from cacheprior.cache import LRUCache
+from cacheprior.cache import LRUCache, vectorized_lru_membership
 from cacheprior.config import CacheConfig, RoutingConfig
 from cacheprior.trace import RouteTrace
 
@@ -20,6 +20,7 @@ class LayerRoutingSpec:
     num_experts: int
     top_k: int
     norm_topk_prob: bool
+    score_scale: float = 1.0
 
 
 class RunningMean:
@@ -31,6 +32,24 @@ class RunningMean:
         self.count += 1
         self.total += float(value)
         return self.total / self.count
+
+    def update_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        values = values.to(torch.float64)
+        if values.ndim != 1:
+            raise ValueError("running-mean values must be one-dimensional")
+        if values.numel() == 0:
+            return values
+        prefix_total = values.cumsum(0) + self.total
+        divisor = torch.arange(
+            self.count + 1,
+            self.count + values.numel() + 1,
+            dtype=torch.float64,
+            device=values.device,
+        )
+        means = prefix_total / divisor
+        self.count += int(values.numel())
+        self.total += float(values.sum().item())
+        return means
 
     @property
     def value(self) -> float:
@@ -151,6 +170,27 @@ class RoutingController:
         cache = self._caches[layer_id]
         estimator = self._range_means[layer_id]
 
+        if (
+            self.routing.policy == "original" or self.routing.lambda_value == 0.0
+        ) and self._token_cursors[layer_id] == 0 and raw_cpu.shape[0] == self._expected_tokens:
+            deltas = raw_cpu.amax(dim=-1) - raw_cpu.amin(dim=-1)
+            range_means = estimator.update_tensor(deltas).to(torch.float32)
+            _, hit_mask = vectorized_lru_membership(
+                orig_ids_cpu,
+                orig_scores_cpu,
+                capacity=self.cache_config.capacity,
+                num_experts=spec.num_experts,
+            )
+
+            buffer.original_ids.extend(row.numpy().copy() for row in orig_ids_cpu)
+            buffer.selected_ids.extend(row.numpy().copy() for row in orig_ids_cpu)
+            buffer.selected_weights.extend(row.numpy().copy() for row in orig_scores_cpu)
+            buffer.hit_mask.extend(row.numpy().copy() for row in hit_mask)
+            buffer.logit_range.extend(float(value) for value in deltas.tolist())
+            buffer.range_mean.extend(float(value) for value in range_means.tolist())
+            self._token_cursors[layer_id] += int(raw_cpu.shape[0])
+            return original_scores, original_ids
+
         for row in range(raw_cpu.shape[0]):
             logits = raw_cpu[row]
             probabilities = probs_cpu[row]
@@ -179,6 +219,7 @@ class RoutingController:
                     selected_scores = selected_scores / selected_scores.sum().clamp_min(
                         torch.finfo(selected_scores.dtype).tiny
                     )
+                selected_scores = selected_scores * spec.score_scale
             else:
                 raise AssertionError(f"unsupported routing policy {self.routing.policy}")
 

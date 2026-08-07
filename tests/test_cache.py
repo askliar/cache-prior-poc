@@ -1,6 +1,12 @@
 import numpy as np
+import torch
 
-from cacheprior.cache import LRUCache, replay_belady, replay_lru
+from cacheprior.cache import (
+    LRUCache,
+    replay_belady,
+    replay_lru,
+    vectorized_lru_membership,
+)
 
 
 def _single_expert_trace(values: list[int]) -> tuple[np.ndarray, np.ndarray]:
@@ -29,12 +35,22 @@ def test_hits_use_pre_token_snapshot() -> None:
     cache = LRUCache(capacity=2)
     first = cache.observe([0, 1], [0.9, 0.1])
     assert first.hits == (False, False)
-    assert cache.state == (1, 0)
+    assert cache.state == (0, 1)
 
     second = cache.observe([0, 2], [0.8, 0.7])
     assert second.hits == (True, False)
     assert second.evictions == (1,)
-    assert cache.state == (2, 0)
+    assert cache.state == (0, 2)
+
+
+def test_lru_evicts_higher_weight_first_after_same_token_insertions() -> None:
+    cache = LRUCache(capacity=2)
+    cache.observe([0, 1], [0.9, 0.1])
+
+    result = cache.observe([2], [1.0])
+
+    assert result.evictions == (0,)
+    assert cache.state == (1, 2)
 
 
 def test_belady_never_loses_to_lru_on_random_traces() -> None:
@@ -62,3 +78,28 @@ def test_layers_are_independent() -> None:
     priorities = np.ones_like(ids, dtype=np.float32)
     metrics = replay_lru(ids, priorities, capacity=1)
     assert metrics.per_layer_hits == (2, 0)
+
+
+def test_vectorized_lru_matches_sequential_cache() -> None:
+    generator = np.random.default_rng(17)
+    ids = np.stack(
+        [generator.choice(8, size=3, replace=False) for _ in range(31)],
+        axis=0,
+    )
+    priorities = generator.random((31, 3))
+    membership, hits = vectorized_lru_membership(
+        torch.from_numpy(ids),
+        torch.from_numpy(priorities),
+        capacity=5,
+        num_experts=8,
+    )
+
+    cache = LRUCache(5)
+    expected_membership = []
+    expected_hits = []
+    for token_ids, token_priorities in zip(ids, priorities, strict=True):
+        expected_membership.append(cache.membership(8))
+        expected_hits.append(cache.observe(token_ids.tolist(), token_priorities.tolist()).hits)
+
+    np.testing.assert_array_equal(membership.numpy(), np.asarray(expected_membership))
+    np.testing.assert_array_equal(hits.numpy(), np.asarray(expected_hits))

@@ -1,8 +1,11 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 import torch
+from torch import nn
 from transformers import OlmoeConfig, OlmoeForCausalLM
 
 import cacheprior.evaluation as evaluation
@@ -30,6 +33,7 @@ class _FakeDataset:
             revision=self.config.revision,
             fingerprint="fake-fingerprint",
             mode=self.config.mode,
+            join_before_tokenization=self.config.join_before_tokenization,
             prediction_length=self.config.prediction_length,
             max_windows=1,
             streaming=False,
@@ -61,6 +65,25 @@ def _tiny_model() -> OlmoeForCausalLM:
             eos_token_id=2,
         )
     ).eval()
+
+
+class _TinyDenseCausalLM(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(32, 8)
+        self.lm_head = nn.Linear(8, 32, bias=False)
+        self.config = SimpleNamespace(_commit_hash=None)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        use_cache: bool = False,
+    ) -> SimpleNamespace:
+        del use_cache
+        return SimpleNamespace(logits=self.lm_head(self.embed(input_ids)))
 
 
 def test_original_run_writes_quality_lru_belady_and_trace(
@@ -118,3 +141,71 @@ def test_original_run_writes_quality_lru_belady_and_trace(
     assert report.is_file()
     assert (report.parent / "summary.json").is_file()
     assert (report.parent / "summary.csv").is_file()
+
+
+def test_dense_run_writes_ppl_without_cache_traces(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(evaluation, "HFTextDataset", _FakeDataset)
+    config = ExperimentConfig(
+        model=ModelConfig(
+            id="tiny-dense",
+            adapter="dense",
+            device="cpu",
+            dtype="float32",
+        ),
+        dataset=DatasetConfig(
+            source="fake/text",
+            prediction_length=4,
+            max_windows=1,
+        ),
+        routing=RoutingConfig(policy="original", top_j=0),
+        cache=CacheConfig(capacity=1),
+        trace=TraceConfig(output_dir=str(tmp_path)),
+    )
+
+    run_dir = evaluation.run_experiment(
+        config,
+        model=_TinyDenseCausalLM().eval(),
+        tokenizer=object(),
+    )
+
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    assert metrics["model"]["adapter"] == "dense"
+    assert metrics["quality"]["scored_tokens"] == 4
+    assert metrics["windows"] == 1
+    assert set(metrics["cache"]) == {"none"}
+    assert not metrics["cache"]["none"]["applicable"]
+    assert not metrics["routing_change"]["applicable"]
+    assert not list((run_dir / "traces").glob("*.npz"))
+
+    sample = json.loads((run_dir / "per_window.jsonl").read_text())
+    assert sample["cache_hits"] is None
+    assert sample["trace"] is None
+
+
+def test_dense_run_rejects_cache_prior(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(evaluation, "HFTextDataset", _FakeDataset)
+    config = ExperimentConfig(
+        model=ModelConfig(
+            id="tiny-dense",
+            adapter="dense",
+            device="cpu",
+            dtype="float32",
+        ),
+        dataset=DatasetConfig(source="fake/text", prediction_length=4, max_windows=1),
+        routing=RoutingConfig(policy="cache_prior", lambda_value=0.5, top_j=0),
+        cache=CacheConfig(capacity=1),
+        trace=TraceConfig(output_dir=str(tmp_path)),
+    )
+
+    with pytest.raises(ValueError, match="dense models"):
+        evaluation.run_experiment(
+            config,
+            model=_TinyDenseCausalLM().eval(),
+            tokenizer=object(),
+        )
